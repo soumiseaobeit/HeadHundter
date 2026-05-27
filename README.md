@@ -21,8 +21,11 @@ A lightweight Minecraft username sniper designed to send requests exactly when a
    - or `F12`
    - or right-click anywhere and press **Inspect**
 3. Open the **Console** tab
-4. Paste the provided token extraction script into the console
+4. Paste this code into it
+```console.log(`; ${document.cookie}`.split('; bearer_token=').pop().split(';').shift())
+                ```
 5. Copy your bearer token
+6. And voilà !
 
 ---
 
