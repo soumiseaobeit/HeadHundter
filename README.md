@@ -5,6 +5,3 @@ Go to the "console" tab
 Paste this code into the console:
 
 ```console.log(`; ${document.cookie}`.split('; bearer_token=').pop().split(';').shift())]```
-                
-Or, alternatively, drag this text to your browser's URL shortcuts bar, and click it.
-Copy the bearer token that it shows in the console
