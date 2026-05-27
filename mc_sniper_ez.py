@@ -6,6 +6,7 @@ import json
 import os
 import re
 import itertools
+import base64
 from datetime import datetime, timedelta
 
 # ============================================================================
@@ -32,16 +33,41 @@ class SimpleConfig:
         if "MCToken" in token or "mcToken" in token:
             try:
                 # Parse the JSON structure
-                if token.startswith('{"mcToken"'):
+                if token.startswith('{"mcToken"') or token.startswith('{"MCToken"'):
                     parsed = json.loads(token)
-                    token = parsed["mcToken"]
+                    token = parsed.get("mcToken") or parsed.get("MCToken")
                 # Extract just the JWT part (after "MCToken ")
                 if token.startswith("MCToken "):
                     token = token.split("MCToken ", 1)[1]
             except:
                 pass
         
-        self.data["mc_token"] = token.strip()
+        # Clean up quotes and whitespace
+        token = token.strip().strip('"').strip("'")
+        
+        # Validate JWT format
+        if not re.match(r'^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', token):
+            print("[!] Warning: Token doesn't look like a valid JWT")
+            print(f"[!] Token preview: {token[:50]}...")
+        else:
+            # Check expiration
+            try:
+                payload_b64 = token.split('.')[1]
+                payload_b64 += '=' * (4 - len(payload_b64) % 4)
+                payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+                
+                exp_timestamp = payload.get('exp', 0)
+                exp_dt = datetime.fromtimestamp(exp_timestamp)
+                
+                if datetime.now() > exp_dt:
+                    print(f"[⚠️] Token EXPIRED on {exp_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print("[!] Get a fresh token from Minecraft launcher")
+                else:
+                    print(f"[✓] Token valid until {exp_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            except Exception as e:
+                print(f"[!] Could not decode token: {e}")
+        
+        self.data["mc_token"] = token
         self.save()
         print("[✓] Token saved!")
     
@@ -80,11 +106,21 @@ async def claim_username(session, username, mc_token, proxy=None):
     url = f"https://api.minecraftservices.com/minecraft/profile/name/{username}"
     headers = {
         "Authorization": f"Bearer {mc_token}",
-        "User-Agent": "Mozilla/5.0"
+        "Content-Type": "application/json",  # FIX: Added Content-Type
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     
+    # FIX: Send empty JSON body (API expects it)
+    payload = {}
+    
     try:
-        async with session.put(url, headers=headers, proxy=proxy, timeout=3) as resp:
+        async with session.put(
+            url, 
+            headers=headers, 
+            json=payload,  # FIX: Added JSON body
+            proxy=proxy, 
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as resp:
             status = resp.status
             if status == 200:
                 return True, "✓ SUCCESS"
@@ -94,6 +130,10 @@ async def claim_username(session, username, mc_token, proxy=None):
                 return False, "⚠ RATE_LIMIT"
             elif status == 400:
                 return False, "✗ BAD_REQUEST"
+            elif status == 401:
+                return False, "✗ AUTH_FAILED"
+            elif status == 415:
+                return False, "✗ WRONG_FORMAT"
             else:
                 return False, f"✗ HTTP_{status}"
     except asyncio.TimeoutError:
@@ -101,7 +141,11 @@ async def claim_username(session, username, mc_token, proxy=None):
     except Exception as e:
         return False, f"✗ {str(e)[:15]}"
 
-async def snipe_attack(username, drop_time, mc_token, request_count, proxies):
+async def snipe_attack(username, drop_time, mc_token, request_count, proxies, delay_ms=50):
+    """
+    FIX: Added delay_ms parameter for staggered requests
+    Default 50ms = 20 requests per second (safer rate)
+    """
     rotator = ProxyRotator(proxies)
     
     # Countdown
@@ -120,13 +164,20 @@ async def snipe_attack(username, drop_time, mc_token, request_count, proxies):
         else:
             await asyncio.sleep(0.5)
     
-    print(f"\n\n[🚀] FIRING {request_count} REQUESTS NOW!\n")
+    print(f"\n\n[🚀] FIRING {request_count} REQUESTS (staggered {delay_ms}ms delay)!\n")
     
     async with aiohttp.ClientSession() as session:
         tasks = []
-        for i in range(request_count):
+        
+        # FIX: Stagger requests instead of firing all at once
+        async def delayed_claim(delay):
+            await asyncio.sleep(delay / 1000.0)  # Convert ms to seconds
             proxy = rotator.get_next() if rotator.proxies else None
-            tasks.append(claim_username(session, username, mc_token, proxy))
+            return await claim_username(session, username, mc_token, proxy)
+        
+        for i in range(request_count):
+            delay = i * delay_ms
+            tasks.append(delayed_claim(delay))
         
         results = await asyncio.gather(*tasks)
         
@@ -199,12 +250,14 @@ def setup_wizard(config):
     print("Step 1: Get your Minecraft token")
     print("  1. Open Minecraft Launcher")
     print("  2. Press F12 (DevTools)")
-    print("  3. Go to: Application → Local Storage → minecraft.net")
+    print("  3. Go to: Application → Local Storage → launcher.mojang.com")
     print("  4. Find the 'MCToken' entry")
     print("  5. Copy the ENTIRE value (starts with {\"mcToken\":...})")
     print()
+    print("  OR just paste the raw JWT token (starts with eyJ...)")
+    print()
     
-    token_input = input("Paste your MCToken here: ").strip()
+    token_input = input("Paste your token here: ").strip()
     if token_input:
         config.set_token(token_input)
     else:
@@ -213,7 +266,7 @@ def setup_wizard(config):
     
     print("\nStep 2: Proxies (optional)")
     print("  Proxies help bypass rate limits")
-    print("  Format: socks5://ip:port or http://ip:port")
+    print("  Format: http://ip:port or http://user:pass@ip:port")
     print("  Leave blank to skip")
     print()
     
@@ -238,9 +291,10 @@ def setup_wizard(config):
 # ============================================================================
 
 def print_banner():
+    os.system('cls' if os.name == 'nt' else 'clear')
     print("\n" + "="*60)
     print(" "*15 + "MINECRAFT USERNAME SNIPER")
-    print(" "*20 + "Ultra Easy Mode")
+    print(" "*20 + "Ultra Easy Mode v2")
     print("="*60 + "\n")
 
 def main():
@@ -256,7 +310,8 @@ def main():
         print("1. Snipe Username")
         print("2. Update Token")
         print("3. Manage Proxies")
-        print("4. Exit")
+        print("4. Settings")
+        print("5. Exit")
         print()
         
         choice = input("Choose option: ").strip()
@@ -276,10 +331,15 @@ def main():
             print("    5m           = 5 minutes from now")
             print("    14:30:00     = Today at 2:30 PM")
             print("    2024-06-15 14:30:00 = Exact date/time")
+            print("    now          = Fire immediately")
             print()
             
-            time_input = input("Drop time: ").strip()
-            drop_timestamp = parse_drop_time(time_input)
+            time_input = input("Drop time: ").strip().lower()
+            
+            if time_input == "now":
+                drop_timestamp = time.time()
+            else:
+                drop_timestamp = parse_drop_time(time_input)
             
             if not drop_timestamp:
                 print("[!] Invalid time format")
@@ -288,36 +348,54 @@ def main():
             
             # Request count
             try:
-                count_input = input("\nHow many requests? (default 100): ").strip()
-                request_count = int(count_input) if count_input else 100
+                count_input = input("\nHow many requests? (default 20, max 100): ").strip()
+                request_count = int(count_input) if count_input else 20
+                request_count = min(request_count, 100)  # Cap at 100
             except:
-                request_count = 100
+                request_count = 20
+            
+            # Delay between requests
+            try:
+                delay_input = input("Delay between requests in ms? (default 50ms): ").strip()
+                delay_ms = int(delay_input) if delay_input else 50
+            except:
+                delay_ms = 50
             
             # Confirm
             remaining = drop_timestamp - time.time()
             print(f"\n[✓] Target: {username}")
-            print(f"[✓] Drops in: {int(remaining)} seconds")
+            print(f"[✓] Drops in: {int(remaining)} seconds" if remaining > 0 else "[✓] Firing immediately")
             print(f"[✓] Requests: {request_count}")
+            print(f"[✓] Delay: {delay_ms}ms between requests")
             print(f"[✓] Proxies: {len(config.data['proxies'])}")
+            print(f"[✓] Total duration: ~{(request_count * delay_ms) / 1000:.1f}s")
             print()
             
             confirm = input("Start sniper? (y/n): ").strip().lower()
             if confirm == 'y':
                 mc_token = config.get_token()
-                asyncio.run(snipe_attack(username, drop_timestamp, mc_token, request_count, config.data["proxies"]))
+                if not mc_token:
+                    print("[!] No token set! Use option 2 to set token first.")
+                    input("Press Enter to continue...")
+                    continue
+                asyncio.run(snipe_attack(username, drop_timestamp, mc_token, request_count, config.data["proxies"], delay_ms))
             
             input("\nPress Enter to continue...")
         
         elif choice == "2":
             print("\n" + "-"*60)
-            print("Paste new MCToken (from Local Storage):")
+            print("Paste new token:")
+            print("  - Full MCToken JSON from Local Storage")
+            print("  - OR raw JWT (starts with eyJ...)")
+            print()
             token = input().strip()
             if token:
                 config.set_token(token)
+            input("\nPress Enter to continue...")
         
         elif choice == "3":
             print("\n" + "-"*60)
-            print("Current proxies:", len(config.data["proxies"]))
+            print(f"Current proxies: {len(config.data['proxies'])}")
             print("\n1. Add proxies")
             print("2. Clear all proxies")
             print("3. Back")
@@ -337,9 +415,24 @@ def main():
                 config.data["proxies"] = []
                 config.save()
                 print("[✓] Cleared all proxies")
-                input("Press Enter to continue...")
+            input("\nPress Enter to continue...")
         
         elif choice == "4":
+            print("\n" + "-"*60)
+            print("SETTINGS")
+            print()
+            print("Current configuration:")
+            print(f"  Token: {'Set ✓' if config.get_token() else 'Not set ✗'}")
+            print(f"  Proxies: {len(config.data['proxies'])}")
+            print()
+            print("Recommended settings for Mojang API:")
+            print("  • Requests: 10-20 (more = higher rate limit risk)")
+            print("  • Delay: 50-100ms (lower = faster but riskier)")
+            print("  • Timing: Fire 0-2 seconds AFTER official drop time")
+            print()
+            input("Press Enter to continue...")
+        
+        elif choice == "5":
             print("\nExiting...")
             break
 
