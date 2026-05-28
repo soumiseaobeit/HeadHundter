@@ -10,6 +10,41 @@ import base64
 from datetime import datetime, timedelta
 
 # ============================================================================
+# TOKEN DECODER (extracts profile info from JWT)
+# ============================================================================
+
+def decode_token_info(token):
+    """Extract profile name and expiration from JWT."""
+    try:
+        # Parse JWT payload
+        payload_b64 = token.split('.')[1]
+        payload_b64 += '=' * (4 - len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        
+        # Extract profile name from pfd array
+        profile_name = "Unknown"
+        if "pfd" in payload and isinstance(payload["pfd"], list) and len(payload["pfd"]) > 0:
+            profile_name = payload["pfd"][0].get("name", "Unknown")
+        
+        # Extract expiration
+        exp_timestamp = payload.get('exp', 0)
+        exp_dt = datetime.fromtimestamp(exp_timestamp)
+        expired = datetime.now() > exp_dt
+        
+        return {
+            "profile": profile_name,
+            "expires": exp_dt.strftime('%Y-%m-%d %H:%M:%S'),
+            "expired": expired
+        }
+    except Exception as e:
+        return {
+            "profile": "Error parsing",
+            "expires": "Unknown",
+            "expired": True,
+            "error": str(e)
+        }
+
+# ============================================================================
 # SIMPLE CONFIG STORAGE
 # ============================================================================
 
@@ -21,22 +56,32 @@ class SimpleConfig:
     def load(self):
         if os.path.exists(self.file):
             with open(self.file, 'r') as f:
-                return json.load(f)
-        return {"mc_token": "", "proxies": []}
+                data = json.load(f)
+                # Migration: convert old single token to array
+                if "mc_token" in data:
+                    old_token = data.pop("mc_token")
+                    if old_token:
+                        data["mc_tokens"] = [old_token]
+                    else:
+                        data["mc_tokens"] = []
+                    self.save_data(data)
+                return data
+        return {"mc_tokens": [], "proxies": []}
     
     def save(self):
-        with open(self.file, 'w') as f:
-            json.dump(self.data, f, indent=2)
+        self.save_data(self.data)
     
-    def set_token(self, token):
+    def save_data(self, data):
+        with open(self.file, 'w') as f:
+            json.dump(data, f, indent=2)
+    
+    def add_token(self, token):
         # Extract JWT from MCToken JSON if needed
         if "MCToken" in token or "mcToken" in token:
             try:
-                # Parse the JSON structure
                 if token.startswith('{"mcToken"') or token.startswith('{"MCToken"'):
                     parsed = json.loads(token)
                     token = parsed.get("mcToken") or parsed.get("MCToken")
-                # Extract just the JWT part (after "MCToken ")
                 if token.startswith("MCToken "):
                     token = token.split("MCToken ", 1)[1]
             except:
@@ -49,30 +94,39 @@ class SimpleConfig:
         if not re.match(r'^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', token):
             print("[!] Warning: Token doesn't look like a valid JWT")
             print(f"[!] Token preview: {token[:50]}...")
-        else:
-            # Check expiration
-            try:
-                payload_b64 = token.split('.')[1]
-                payload_b64 += '=' * (4 - len(payload_b64) % 4)
-                payload = json.loads(base64.urlsafe_b64decode(payload_b64))
-                
-                exp_timestamp = payload.get('exp', 0)
-                exp_dt = datetime.fromtimestamp(exp_timestamp)
-                
-                if datetime.now() > exp_dt:
-                    print(f"[⚠️] Token EXPIRED on {exp_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                    print("[!] Get a fresh token from Minecraft launcher")
-                else:
-                    print(f"[✓] Token valid until {exp_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-            except Exception as e:
-                print(f"[!] Could not decode token: {e}")
+            return False
         
-        self.data["mc_token"] = token
+        # Check if already exists
+        if token in self.data["mc_tokens"]:
+            print("[!] Token already exists")
+            return False
+        
+        # Decode and show info
+        info = decode_token_info(token)
+        if info["expired"]:
+            print(f"[⚠️] Token EXPIRED on {info['expires']}")
+            print("[!] Get a fresh token from Minecraft launcher")
+            confirm = input("Add anyway? (y/n): ").strip().lower()
+            if confirm != 'y':
+                return False
+        else:
+            print(f"[✓] Profile: {info['profile']}")
+            print(f"[✓] Valid until {info['expires']}")
+        
+        self.data["mc_tokens"].append(token)
         self.save()
-        print("[✓] Token saved!")
+        print("[✓] Token added!")
+        return True
     
-    def get_token(self):
-        return self.data["mc_token"]
+    def get_tokens(self):
+        return self.data["mc_tokens"]
+    
+    def remove_token(self, index):
+        if 0 <= index < len(self.data["mc_tokens"]):
+            removed = self.data["mc_tokens"].pop(index)
+            self.save()
+            return True
+        return False
     
     def add_proxies(self, proxy_list):
         self.data["proxies"] = [p.strip() for p in proxy_list if p.strip()]
@@ -80,7 +134,7 @@ class SimpleConfig:
         print(f"[✓] Saved {len(self.data['proxies'])} proxies")
 
 # ============================================================================
-# PROXY HANDLER
+# ROTATORS
 # ============================================================================
 
 class ProxyRotator:
@@ -98,6 +152,21 @@ class ProxyRotator:
         self.current = next(self.pool)
         return self.current
 
+class TokenRotator:
+    def __init__(self, tokens):
+        self.tokens = tokens
+        if self.tokens:
+            self.pool = itertools.cycle(self.tokens)
+            self.current = next(self.pool)
+        else:
+            self.current = None
+    
+    def get_next(self):
+        if not self.tokens:
+            return None
+        self.current = next(self.pool)
+        return self.current
+
 # ============================================================================
 # SNIPER CORE
 # ============================================================================
@@ -106,18 +175,17 @@ async def claim_username(session, username, mc_token, proxy=None):
     url = f"https://api.minecraftservices.com/minecraft/profile/name/{username}"
     headers = {
         "Authorization": f"Bearer {mc_token}",
-        "Content-Type": "application/json",  # FIX: Added Content-Type
+        "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     
-    # FIX: Send empty JSON body (API expects it)
     payload = {}
     
     try:
         async with session.put(
             url, 
             headers=headers, 
-            json=payload,  # FIX: Added JSON body
+            json=payload,
             proxy=proxy, 
             timeout=aiohttp.ClientTimeout(total=5)
         ) as resp:
@@ -141,12 +209,13 @@ async def claim_username(session, username, mc_token, proxy=None):
     except Exception as e:
         return False, f"✗ {str(e)[:15]}"
 
-async def snipe_attack(username, drop_time, mc_token, request_count, proxies, delay_ms=50):
+async def snipe_attack(username, drop_time, mc_tokens, request_count, proxies, delay_ms=50):
     """
-    FIX: Added delay_ms parameter for staggered requests
-    Default 50ms = 20 requests per second (safer rate)
+    Multi-token distributed attack.
+    Requests are spread evenly across all tokens to bypass rate limits.
     """
-    rotator = ProxyRotator(proxies)
+    proxy_rotator = ProxyRotator(proxies)
+    token_rotator = TokenRotator(mc_tokens)
     
     # Countdown
     while True:
@@ -164,16 +233,16 @@ async def snipe_attack(username, drop_time, mc_token, request_count, proxies, de
         else:
             await asyncio.sleep(0.5)
     
-    print(f"\n\n[🚀] FIRING {request_count} REQUESTS (staggered {delay_ms}ms delay)!\n")
+    print(f"\n\n[🚀] FIRING {request_count} REQUESTS across {len(mc_tokens)} token(s) (staggered {delay_ms}ms delay)!\n")
     
     async with aiohttp.ClientSession() as session:
         tasks = []
         
-        # FIX: Stagger requests instead of firing all at once
         async def delayed_claim(delay):
-            await asyncio.sleep(delay / 1000.0)  # Convert ms to seconds
-            proxy = rotator.get_next() if rotator.proxies else None
-            return await claim_username(session, username, mc_token, proxy)
+            await asyncio.sleep(delay / 1000.0)
+            token = token_rotator.get_next()
+            proxy = proxy_rotator.get_next() if proxy_rotator.proxies else None
+            return await claim_username(session, username, token, proxy)
         
         for i in range(request_count):
             delay = i * delay_ms
@@ -194,6 +263,8 @@ async def snipe_attack(username, drop_time, mc_token, request_count, proxies, de
             print(f"[❌] Failed to claim '{username}'")
         print("="*50)
         print(f"\nTotal requests: {request_count}")
+        print(f"Tokens used: {len(mc_tokens)}")
+        print(f"Requests per token: ~{request_count // len(mc_tokens) if mc_tokens else 0}")
         print(f"Successful: {success}")
         print("\nStatus breakdown:")
         for status, count in sorted(status_counts.items(), key=lambda x: -x[1]):
@@ -247,7 +318,7 @@ def setup_wizard(config):
     print(" "*20 + "FIRST TIME SETUP")
     print("="*60 + "\n")
     
-    print("Step 1: Get your Minecraft token")
+    print("Step 1: Get your Minecraft token(s)")
     print("  1. Open Minecraft Launcher")
     print("  2. Press F12 (DevTools)")
     print("  3. Go to: Application → Local Storage → launcher.mojang.com")
@@ -256,13 +327,24 @@ def setup_wizard(config):
     print()
     print("  OR just paste the raw JWT token (starts with eyJ...)")
     print()
+    print("  TIP: Add multiple accounts to distribute requests and bypass rate limits!")
+    print()
     
-    token_input = input("Paste your token here: ").strip()
+    token_input = input("Paste your first token here: ").strip()
     if token_input:
-        config.set_token(token_input)
+        config.add_token(token_input)
     else:
         print("[!] No token provided, you'll need to set this later")
         return
+    
+    # Offer to add more
+    while True:
+        add_more = input("\nAdd another token? (y/n): ").strip().lower()
+        if add_more != 'y':
+            break
+        token = input("Paste token: ").strip()
+        if token:
+            config.add_token(token)
     
     print("\nStep 2: Proxies (optional)")
     print("  Proxies help bypass rate limits")
@@ -293,22 +375,22 @@ def setup_wizard(config):
 def print_banner():
     os.system('cls' if os.name == 'nt' else 'clear')
     print("\n" + "="*60)
-    print(" "*15 + "MINECRAFT USERNAME SNIPER")
-    print(" "*20 + "Ultra Easy Mode v2")
+    print(" "*15 + "HEADHUNTER USERNAME SNIPER V2")
+    print(" "*20 + "BY Obeit")
     print("="*60 + "\n")
 
 def main():
     config = SimpleConfig()
     
     # First run setup
-    if not config.get_token():
+    if not config.get_tokens():
         setup_wizard(config)
     
     while True:
         print_banner()
         
         print("1. Snipe Username")
-        print("2. Update Token")
+        print("2. Manage Tokens")
         print("3. Manage Proxies")
         print("4. Settings")
         print("5. Exit")
@@ -348,9 +430,9 @@ def main():
             
             # Request count
             try:
-                count_input = input("\nHow many requests? (default 20, max 100): ").strip()
+                count_input = input("\nHow many requests? (default 20, max 500): ").strip()
                 request_count = int(count_input) if count_input else 20
-                request_count = min(request_count, 100)  # Cap at 100
+                request_count = min(request_count, 500)  # Cap at 500 with multi-token
             except:
                 request_count = 20
             
@@ -362,10 +444,18 @@ def main():
                 delay_ms = 50
             
             # Confirm
+            tokens = config.get_tokens()
+            if not tokens:
+                print("[!] No tokens configured! Use option 2 to add tokens first.")
+                input("Press Enter to continue...")
+                continue
+            
             remaining = drop_timestamp - time.time()
             print(f"\n[✓] Target: {username}")
             print(f"[✓] Drops in: {int(remaining)} seconds" if remaining > 0 else "[✓] Firing immediately")
-            print(f"[✓] Requests: {request_count}")
+            print(f"[✓] Total requests: {request_count}")
+            print(f"[✓] Tokens: {len(tokens)} accounts")
+            print(f"[✓] Requests per token: ~{request_count // len(tokens)}")
             print(f"[✓] Delay: {delay_ms}ms between requests")
             print(f"[✓] Proxies: {len(config.data['proxies'])}")
             print(f"[✓] Total duration: ~{(request_count * delay_ms) / 1000:.1f}s")
@@ -373,25 +463,58 @@ def main():
             
             confirm = input("Start sniper? (y/n): ").strip().lower()
             if confirm == 'y':
-                mc_token = config.get_token()
-                if not mc_token:
-                    print("[!] No token set! Use option 2 to set token first.")
-                    input("Press Enter to continue...")
-                    continue
-                asyncio.run(snipe_attack(username, drop_timestamp, mc_token, request_count, config.data["proxies"], delay_ms))
+                asyncio.run(snipe_attack(username, drop_timestamp, tokens, request_count, config.data["proxies"], delay_ms))
             
             input("\nPress Enter to continue...")
         
         elif choice == "2":
-            print("\n" + "-"*60)
-            print("Paste new token:")
-            print("  - Full MCToken JSON from Local Storage")
-            print("  - OR raw JWT (starts with eyJ...)")
-            print()
-            token = input().strip()
-            if token:
-                config.set_token(token)
-            input("\nPress Enter to continue...")
+            # Token management
+            while True:
+                print("\n" + "-"*60)
+                print("TOKEN MANAGEMENT")
+                print()
+                
+                tokens = config.get_tokens()
+                if tokens:
+                    print("Current tokens:")
+                    for i, token in enumerate(tokens):
+                        info = decode_token_info(token)
+                        status = "EXPIRED" if info["expired"] else "Valid"
+                        print(f"  {i+1}. {info['profile']} - {status} until {info['expires']}")
+                else:
+                    print("No tokens configured")
+                
+                print()
+                print("1. Add token")
+                print("2. Remove token")
+                print("3. Back")
+                
+                token_choice = input("\nChoose: ").strip()
+                
+                if token_choice == "1":
+                    print("\nPaste token (MCToken JSON or raw JWT):")
+                    token = input().strip()
+                    if token:
+                        config.add_token(token)
+                    input("\nPress Enter to continue...")
+                
+                elif token_choice == "2":
+                    if not tokens:
+                        print("[!] No tokens to remove")
+                        input("\nPress Enter to continue...")
+                        continue
+                    try:
+                        idx = int(input("Enter token number to remove: ").strip()) - 1
+                        if config.remove_token(idx):
+                            print("[✓] Token removed")
+                        else:
+                            print("[!] Invalid token number")
+                    except:
+                        print("[!] Invalid input")
+                    input("\nPress Enter to continue...")
+                
+                elif token_choice == "3":
+                    break
         
         elif choice == "3":
             print("\n" + "-"*60)
@@ -418,16 +541,32 @@ def main():
             input("\nPress Enter to continue...")
         
         elif choice == "4":
+            # Settings with profile info
             print("\n" + "-"*60)
-            print("SETTINGS")
+            print("SETTINGS & ACCOUNT INFO")
             print()
-            print("Current configuration:")
-            print(f"  Token: {'Set ✓' if config.get_token() else 'Not set ✗'}")
-            print(f"  Proxies: {len(config.data['proxies'])}")
+            
+            tokens = config.get_tokens()
+            print("Configured Accounts:")
+            if tokens:
+                for i, token in enumerate(tokens):
+                    info = decode_token_info(token)
+                    status_icon = "✗" if info["expired"] else "✓"
+                    print(f"  {status_icon} Account {i+1}: {info['profile']}")
+                    print(f"    Expires: {info['expires']}")
+                    if info["expired"]:
+                        print(f"    Status: EXPIRED - needs refresh")
+                    print()
+            else:
+                print("  No accounts configured")
+            
+            print(f"Proxies: {len(config.data['proxies'])}")
             print()
             print("Recommended settings for Mojang API:")
-            print("  • Requests: 10-20 (more = higher rate limit risk)")
-            print("  • Delay: 50-100ms (lower = faster but riskier)")
+            print("  • With 1 token: 10-20 requests, 50-100ms delay")
+            print("  • With 2 tokens: 20-40 requests, 50ms delay")
+            print("  • With 3+ tokens: 30-100 requests, 30-50ms delay")
+            print("  • More tokens = more requests without hitting rate limits")
             print("  • Timing: Fire 0-2 seconds AFTER official drop time")
             print()
             input("Press Enter to continue...")

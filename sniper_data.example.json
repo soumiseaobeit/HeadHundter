@@ -1,0 +1,10 @@
+{
+  "mc_tokens": [
+    "eyJhbGciOiJSUzI1NiIsImtpZCI6IjZDRDYyMTYzMkNFRS4uLiAopaste your token here)",
+    "eyJhbGciOiJSUzI1NiIsImtpZCI6IjZDRDYyMTYzMkNFRS4uLiAoadd more tokens here)"
+  ],
+  "proxies": [
+    "http://user:pass@ip:port",
+    "socks5://user:pass@ip:port"
+  ]
+}
